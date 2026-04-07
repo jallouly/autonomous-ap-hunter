@@ -1,83 +1,205 @@
 import asyncio
 import socket
+import math
 import time
 from mavsdk import System
-
-UDP_IP = "127.0.0.1"
+ 
+# ─── Configuration ────────────────────────────────────────────────────────────
+ 
+UDP_IP   = "127.0.0.1"
 UDP_PORT = 8080
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-async def log_telemetry(drone):
-    """Background task to stream GPS data without blocking the queue."""
-    print(f"Starting telemetry stream to {UDP_IP}:{UDP_PORT}...")
-    last_print = time.time()
-    
-    # The async loop now runs at full speed, draining the queue instantly
-    async for position in drone.telemetry.position():
-        # We only send a packet if 1 second has passed
-        if time.time() - last_print >= 1.0:
-            lat = position.latitude_deg
-            lon = position.longitude_deg
-            alt = position.relative_altitude_m
-            
-            payload = f"LAT:{lat:.6f}, LON:{lon:.6f}, ALT:{alt:.2f}m"
-            sock.sendto(payload.encode(), (UDP_IP, UDP_PORT))
-            print(f"[PYTHON SENT] {payload}")
-            last_print = time.time()
-
-async def run():
-    drone = System()
-    print("Connecting to drone on UDP port 14540...")
-    await drone.connect(system_address="udp://:14540")
-
-    async for state in drone.core.connection_state():
-        if state.is_connected:
-            break
-
-    print("Waiting for GPS lock...")
-    async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
-            break
-
-    # Get the starting absolute altitude (needed for grid navigation)
+ 
+# Grid size in GPS degrees.
+# ~0.00018° ≈ 20 metres. Increase for larger scan areas.
+GRID_OFFSET_DEG = 0.00018
+ 
+# Altitude layers to sweep (metres, relative to launch point).
+# Add more values to scan additional floors.
+ALTITUDE_LAYERS_M = [5.0, 10.0, 15.0]
+ 
+# Drone must come within this radius (metres) of a waypoint to continue.
+WAYPOINT_ACCEPTANCE_RADIUS_M = 1.5
+ 
+# Max time (seconds) to wait for the drone to reach any single waypoint.
+# Prevents hanging forever if the drone is stuck.
+WAYPOINT_TIMEOUT_S = 45
+ 
+# How long to wait (seconds) after takeoff before starting the grid.
+TAKEOFF_SETTLE_S = 8
+ 
+# Telemetry send interval (seconds) — rate-limits UDP packets to C++ engine.
+TELEMETRY_INTERVAL_S = 1.0
+ 
+# ─── 3D Distance helper ───────────────────────────────────────────────────────
+ 
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle surface distance in metres."""
+    R = 6371e3
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi   = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+ 
+ 
+def distance_3d(pos, target_lat: float, target_lon: float, target_alt: float) -> float:
+    """Euclidean 3D distance from a MAVSDK position object to a target (metres)."""
+    d_surface  = haversine_m(pos.latitude_deg, pos.longitude_deg, target_lat, target_lon)
+    d_vertical = pos.relative_altitude_m - target_alt
+    return math.sqrt(d_surface**2 + d_vertical**2)
+ 
+# ─── Telemetry streaming ──────────────────────────────────────────────────────
+ 
+async def stream_telemetry(drone: System, sock: socket.socket) -> None:
+    """
+    Background task: forwards GPS telemetry to the C++ spatial engine over UDP.
+    Rate-limited by TELEMETRY_INTERVAL_S to avoid flooding the socket.
+    """
+    print(f"[TELEM] Streaming to {UDP_IP}:{UDP_PORT} every {TELEMETRY_INTERVAL_S}s")
+    last_sent = 0.0
+ 
     async for pos in drone.telemetry.position():
-        initial_lat = pos.latitude_deg
-        initial_lon = pos.longitude_deg
-        abs_alt = pos.absolute_altitude_m
-        break
-
-    asyncio.ensure_future(log_telemetry(drone))
-
-    print("-- Arming Motors")
-    await drone.action.arm()
-
-    print("-- Taking off to 5 meters")
-    await drone.action.set_takeoff_altitude(5.0)
-    await drone.action.takeoff()
-    await asyncio.sleep(8) # Wait 8 seconds to reach altitude
-
-    # Roughly 20 meters in GPS coordinates
-    offset = 0.00018 
-
-    # Define a 4-point square grid search pattern
-    waypoints = [
-        (initial_lat + offset, initial_lon),               # Point 1: North
-        (initial_lat + offset, initial_lon + offset),      # Point 2: North-East
-        (initial_lat, initial_lon + offset),               # Point 3: East
-        (initial_lat, initial_lon)                         # Point 4: Back to start
+        now = time.monotonic()
+        if now - last_sent < TELEMETRY_INTERVAL_S:
+            continue
+        last_sent = now
+ 
+        lat = pos.latitude_deg
+        lon = pos.longitude_deg
+        alt = pos.relative_altitude_m
+        payload = f"LAT:{lat:.6f}, LON:{lon:.6f}, ALT:{alt:.2f}m"
+        sock.sendto(payload.encode(), (UDP_IP, UDP_PORT))
+        print(f"[TELEM] Sent → {payload}")
+ 
+# ─── Waypoint navigation ──────────────────────────────────────────────────────
+ 
+async def fly_to(drone: System,
+                 lat: float, lon: float,
+                 rel_alt: float, abs_alt: float,
+                 label: str) -> bool:
+    """
+    Command the drone to a waypoint and WAIT until it physically arrives.
+ 
+    rel_alt : altitude relative to launch (for distance calculation)
+    abs_alt : absolute altitude sent to goto_location (MAVSDK requires this)
+ 
+    Returns True on success, False if the timeout expired.
+    """
+    print(f"[NAV] Flying to {label} → ({lat:.6f}, {lon:.6f}, {rel_alt:.1f}m rel)")
+    await drone.action.goto_location(lat, lon, abs_alt, 0)
+ 
+    deadline = time.monotonic() + WAYPOINT_TIMEOUT_S
+    async for pos in drone.telemetry.position():
+        dist = distance_3d(pos, lat, lon, rel_alt)
+        if dist < WAYPOINT_ACCEPTANCE_RADIUS_M:
+            print(f"[NAV] Reached {label} (dist={dist:.2f}m) ✓")
+            return True
+        if time.monotonic() > deadline:
+            print(f"[NAV] ⚠ Timeout reaching {label} — moving on.")
+            return False
+ 
+    return False  # stream ended unexpectedly
+ 
+# ─── Grid builder ─────────────────────────────────────────────────────────────
+ 
+def build_grid(origin_lat: float, origin_lon: float) -> list[tuple[float, float, str]]:
+    """
+    Build a list of (lat, lon, label) waypoints forming a lawnmower pattern
+    over the scan area.
+ 
+    The same XY footprint is repeated for every altitude layer defined in
+    ALTITUDE_LAYERS_M. Altitude is NOT included here — it is injected in run()
+    where we know the absolute altitude reference.
+ 
+    Pattern per layer (viewed from above):
+        NW ──→ NE
+                ↓
+        SW ←── SE
+    """
+    o  = GRID_OFFSET_DEG
+    corners = [
+        (origin_lat + o, origin_lon,     "NW"),
+        (origin_lat + o, origin_lon + o, "NE"),
+        (origin_lat,     origin_lon + o, "SE"),
+        (origin_lat,     origin_lon,     "SW"),
     ]
-
-    flight_alt = abs_alt + 5.0 # Keep it 5 meters above sea level
-
-    for i, (w_lat, w_lon) in enumerate(waypoints):
-        print(f"-- Flying to Waypoint {i+1}...")
-        # goto_location(latitude, longitude, absolute_altitude, yaw_angle)
-        await drone.action.goto_location(w_lat, w_lon, flight_alt, 0)
-        await asyncio.sleep(10) # Give the drone 10 seconds to fly to each point
-
-    print("-- Returning to Launch and Landing")
-    await drone.action.return_to_launch()
-    await asyncio.sleep(15)
-
+    return corners  # same corners reused per layer in run()
+ 
+# ─── Main ─────────────────────────────────────────────────────────────────────
+ 
+async def run() -> None:
+    # --- Socket: created here, closed in finally ---
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ 
+    try:
+        drone = System()
+        print("[INIT] Connecting to drone on UDP port 14540...")
+        await drone.connect(system_address="udp://:14540")
+ 
+        print("[INIT] Waiting for connection...")
+        async for state in drone.core.connection_state():
+            if state.is_connected:
+                print("[INIT] Drone connected ✓")
+                break
+ 
+        print("[INIT] Waiting for GPS lock...")
+        async for health in drone.telemetry.health():
+            if health.is_global_position_ok and health.is_home_position_ok:
+                print("[INIT] GPS lock acquired ✓")
+                break
+ 
+        # Capture origin position and absolute altitude reference
+        async for pos in drone.telemetry.position():
+            origin_lat = pos.latitude_deg
+            origin_lon = pos.longitude_deg
+            abs_alt_ref = pos.absolute_altitude_m  # sea-level reference
+            break
+ 
+        print(f"[INIT] Origin: ({origin_lat:.6f}, {origin_lon:.6f}), "
+              f"abs_alt_ref={abs_alt_ref:.1f}m")
+ 
+        # Start telemetry streaming in background
+        asyncio.ensure_future(stream_telemetry(drone, sock))
+ 
+        # Arm and take off
+        print("[FLIGHT] Arming motors...")
+        await drone.action.arm()
+ 
+        first_layer_alt = ALTITUDE_LAYERS_M[0]
+        print(f"[FLIGHT] Taking off to {first_layer_alt}m...")
+        await drone.action.set_takeoff_altitude(first_layer_alt)
+        await drone.action.takeoff()
+        await asyncio.sleep(TAKEOFF_SETTLE_S)
+ 
+        # Build the XY grid pattern
+        grid_corners = build_grid(origin_lat, origin_lon)
+ 
+        # ── 3D sweep: same XY corners at every altitude layer ──
+        for layer_idx, rel_alt in enumerate(ALTITUDE_LAYERS_M):
+            abs_alt = abs_alt_ref + rel_alt
+            print(f"\n[GRID] ── Layer {layer_idx + 1}/{len(ALTITUDE_LAYERS_M)}: "
+                  f"{rel_alt}m ──")
+ 
+            for (wp_lat, wp_lon, corner) in grid_corners:
+                label = f"L{layer_idx + 1}-{corner}"
+                await fly_to(drone, wp_lat, wp_lon, rel_alt, abs_alt, label)
+ 
+        # Return to launch
+        print("\n[FLIGHT] Grid complete. Returning to launch...")
+        await drone.action.return_to_launch()
+ 
+        # Wait for landing (poll altitude instead of a fixed sleep)
+        print("[FLIGHT] Waiting for landing...")
+        async for pos in drone.telemetry.position():
+            if pos.relative_altitude_m < 0.3:
+                print("[FLIGHT] Landed ✓")
+                break
+ 
+    finally:
+        sock.close()
+        print("[INIT] UDP socket closed.")
+ 
+ 
 if __name__ == "__main__":
     asyncio.run(run())
+ 

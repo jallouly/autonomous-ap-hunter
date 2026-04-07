@@ -2,7 +2,7 @@ import asyncio
 import socket
 from mavsdk import System
 
-# Configure the UDP socket to talk to C++
+# 1. Configure the UDP socket to talk to C++
 UDP_IP = "127.0.0.1"
 UDP_PORT = 8080
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -16,10 +16,10 @@ async def log_telemetry(drone):
         lon = position.longitude_deg
         alt = position.relative_altitude_m
         
-        # Format the data as a simple string payload
+        # 2. Format the data as a simple string payload
         payload = f"LAT:{lat:.6f}, LON:{lon:.6f}, ALT:{alt:.2f}m"
         
-        # Fire the packet over the network to the C++ listener
+        # 3. Fire the packet over the network to the C++ listener
         sock.sendto(payload.encode(), (UDP_IP, UDP_PORT))
         print(f"[PYTHON SENT] {payload}")
         

@@ -1,0 +1,15 @@
+# Network Settings
+network:
+  udp_ip: "127.0.0.1"
+  udp_port: 8080
+
+# The specific Access Point we are hunting (Phase 2)
+target_ap:
+  latitude: 47.398000
+  longitude: 8.546200
+  altitude: 25.0
+
+# Drone Flight Parameters
+flight:
+  takeoff_alt: 5.0
+  grid_offset: 0.00018

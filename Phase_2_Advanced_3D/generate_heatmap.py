@@ -1,114 +1,87 @@
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from scipy import interpolate
 import argparse
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+import plotly.graph_objects as go
 import os
 
-# Configuration block
-CONFIG = {
-    'interpolation_method': 'cubic',  
-    'grid_resolution': 150,  # Bumped up for smoother curves
-    'visualization_params': {
-        'color_map': 'viridis',  # Upgraded from 'jet' to perceptual standard
-        'alpha': 0.85  
-    }
-}
+# 1. Setup Command Line Arguments
+parser = argparse.ArgumentParser(description="Generate 3D RF Heatmaps for multiple Rogue APs")
+parser.add_argument("--input", required=True, help="Input CSV file (e.g., rogue_ap_hunt.csv)")
+parser.add_argument("--output", required=True, help="Output filename prefix (e.g., scan_results)")
+args = parser.parse_args()
 
-def generate_heatmap(x, y, z):
-    # Create dense grid for interpolation
-    grid_x, grid_y = np.mgrid[min(x):max(x):CONFIG['grid_resolution']*1j, 
-                               min(y):max(y):CONFIG['grid_resolution']*1j]
+# 2. Load the telemetry data
+print(f"[*] Loading flight data from {args.input}...")
+try:
+    df = pd.read_csv(args.input)
+except FileNotFoundError:
+    print(f"[!] Error: {args.input} not found. Did you fly the mission?")
+    exit(1)
 
-    # Interpolate signal bleed between actual flight paths
-    grid_z = interpolate.griddata((x, y), z, (grid_x, grid_y), method=CONFIG['interpolation_method'])
-    return grid_x, grid_y, grid_z
+# 3. Find all unique MAC addresses discovered
+unique_aps = df['AP_Label'].unique()
+print(f"[*] Discovered {len(unique_aps)} unique Access Points!")
 
-def plot_2d_heatmap(grid_x, grid_y, grid_z, flight_x, flight_y, ap_name, output_path):
+# 4. Generate Maps for EACH Access Point
+for ap in unique_aps:
+    print(f"  -> Generating spatial maps for MAC: {ap}...")
+    
+    ap_data = df[df['AP_Label'] == ap]
+    
+    if len(ap_data) < 5:
+        print(f"     [!] Not enough data points to map {ap}. Skipping.")
+        continue
+
+    x = ap_data['Longitude'].values
+    y = ap_data['Latitude'].values
+    z = ap_data['RSSI_dBm'].values
+
+    # Create a meshgrid for interpolation
+    xi = np.linspace(x.min(), x.max(), 100)
+    yi = np.linspace(y.min(), y.max(), 100)
+    xi, yi = np.meshgrid(xi, yi)
+
+    # Interpolate RSSI values across the grid
+    zi = griddata((x, y), z, (xi, yi), method='cubic')
+    
+    safe_ap_name = ap.replace(":", "")
+
+    # --- 2D HEATMAP (Standard PNG for READMEs) ---
     plt.figure(figsize=(10, 8))
-    plt.imshow(grid_z.T, extent=(min(grid_x.flatten()), max(grid_x.flatten()), 
-                                 min(grid_y.flatten()), max(grid_y.flatten())), 
-               origin='lower', cmap=CONFIG['visualization_params']['color_map'], 
-               alpha=CONFIG['visualization_params']['alpha'])
+    contour = plt.contourf(xi, yi, zi, levels=20, cmap='viridis')
+    plt.colorbar(contour, label='RSSI (dBm)')
+    plt.scatter(x, y, c='red', s=10, label='Drone Flight Path')
     
-    plt.colorbar(label='RSSI Signal Strength (dBm)')
-    plt.plot(flight_x, flight_y, 'w.', markersize=1.5, alpha=0.4, label='Drone Flight Path')
+    max_idx = np.argmax(z)
+    plt.scatter(x[max_idx], y[max_idx], c='gold', marker='*', s=300, edgecolor='black', label=f'Estimated Location ({z[max_idx]} dBm)')
     
-    plt.title(f'2D Interpolated RF Heatmap: {ap_name}')
+    plt.title(f'2D RF Heatmap - Target: {ap}')
     plt.xlabel('Longitude')
     plt.ylabel('Latitude')
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300)
-    plt.close() # Free up memory
-    print(f"  [+] 2D Heatmap saved to: {output_path}")
+    plt.savefig(f'{args.output}_{safe_ap_name}_2D.png')
+    plt.close()
 
-def create_3d_surface_plot(grid_x, grid_y, grid_z, ap_name, output_path):
-    fig = plt.figure(figsize=(12, 8))
-    ax = fig.add_subplot(111, projection='3d')
+    # --- TRUE 3D INTERACTIVE FILE (Plotly HTML) ---
+    fig = go.Figure(data=[go.Surface(z=zi, x=xi, y=yi, colorscale='Viridis', opacity=0.9)])
     
-    surf = ax.plot_surface(grid_x, grid_y, grid_z, 
-                           cmap=CONFIG['visualization_params']['color_map'], 
-                           alpha=CONFIG['visualization_params']['alpha'],
-                           linewidth=0, antialiased=True)
+    # Add the drone's actual flight path as a red 3D line
+    fig.add_trace(go.Scatter3d(x=x, y=y, z=z, mode='lines+markers', 
+                               marker=dict(size=4, color='red'),
+                               line=dict(color='red', width=2),
+                               name='Flight Path'))
+
+    fig.update_layout(title=f'Interactive 3D Signal Topology - MAC: {ap}',
+                      autosize=True,
+                      scene=dict(xaxis_title='Longitude',
+                                 yaxis_title='Latitude',
+                                 zaxis_title='RSSI (dBm)'))
     
-    fig.colorbar(surf, shrink=0.5, aspect=5, label='RSSI (dBm)')
-    ax.set_xlabel('Longitude')
-    ax.set_ylabel('Latitude')
-    ax.set_zlabel('Signal strength (dBm)')
-    plt.title(f'3D Spatial RF Surface Plot: {ap_name}')
-    
-    plt.savefig(output_path, dpi=300)
-    plt.close() # Free up memory
-    print(f"  [+] 3D Surface Plot saved to: {output_path}")
+    # Save as an interactive webpage!
+    html_filename = f'{args.output}_{safe_ap_name}_3D_Interactive.html'
+    fig.write_html(html_filename)
+    print(f"     [+] Created interactive 3D file: {html_filename}")
 
-def main(input_path, output_prefix):
-    try:
-        print(f"[*] Processing {input_path}...")
-        
-        # Pandas easily handles the mixed string/float columns
-        df = pd.read_csv(input_path)
-        
-        if df.empty:
-            print("[!] CSV is empty.")
-            return
-
-        # Fallback if testing with older CSVs that lack the AP_Label column
-        if 'AP_Label' not in df.columns:
-            df['AP_Label'] = 'Unknown_Target'
-
-        # Group data by each unique Access Point found in the scan
-        grouped_aps = df.groupby('AP_Label')
-        print(f"[*] Found {len(grouped_aps)} unique Access Point(s) in the data.")
-
-        for ap_name, group_data in grouped_aps:
-            print(f"[*] Generating visuals for AP: {ap_name}")
-            
-            x = group_data['Longitude'].values
-            y = group_data['Latitude'].values
-            z = group_data['RSSI_dBm'].values
-            
-            # If the drone didn't move enough to interpolate, skip to avoid crashes
-            if len(np.unique(x)) < 3 or len(np.unique(y)) < 3:
-                print(f"  [!] Not enough spatial variance to interpolate {ap_name}. Skipping.")
-                continue
-
-            grid_x, grid_y, grid_z = generate_heatmap(x, y, z)
-
-            # Generate dynamic filenames based on the AP name
-            safe_ap_name = str(ap_name).replace(" ", "_")
-            path_2d = f"{output_prefix}_{safe_ap_name}_2D.png"
-            path_3d = f"{output_prefix}_{safe_ap_name}_3D.png"
-
-            plot_2d_heatmap(grid_x, grid_y, grid_z, x, y, ap_name, path_2d)
-            create_3d_surface_plot(grid_x, grid_y, grid_z, ap_name, path_3d)
-
-    except Exception as e:
-        print(f'[!] Error processing file: {str(e)}')
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Generate heatmaps from AP data.')
-    parser.add_argument('--input', type=str, required=True, help='Input CSV data file path')
-    parser.add_argument('--output', type=str, required=True, help='Output prefix (e.g., "scan_results")')
-    args = parser.parse_args()
-    main(args.input, args.output)
+print(f"\n[*] Mission Accomplished. All interactive 3D files saved with prefix '{args.output}'!")
